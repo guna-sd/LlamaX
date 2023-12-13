@@ -1,5 +1,5 @@
-## LamaX: Upgraded Language Model with Sparse Attention
-LamaX is designed as an upgraded version of the Llama model, introducing sparse attention to enhance efficiency and performance.
+## LamaX:
+LamaX is designed as an upgraded version of the [Llama](https://github.com/facebookresearch/llama).
 
 ## Sparse Attention Integration: 
-LamaX uses sparse attention to selectively attend to relevant parts of the input, reducing computational costs while maintaining high performance.
+LamaX uses [sparse attention](https://openai.com/research/sparse-transformer) to selectively attend to relevant parts of the input, reducing computational costs while maintaining high performance.
