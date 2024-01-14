@@ -6,22 +6,23 @@ from dataclasses import dataclass
 import math
 from typing import Optional, List
 
-
 @dataclass
 class ModelArgs:
     # default hyperparameters for the LlamaX Mini models [42M]
-    dim: int = 512
-    n_layers: int = 8
-    n_heads: int = 8
-    n_kv_heads: int = 8
-    vocab_size: int = 32000
-    hidden_dim: Optional[int] = 1376
-    multiple_of: int = 32
-    norm_eps: float = 1e-05
-    max_seq_len: int = 1024
-    dropout: float = 0.0
-    attn_mode : List[str] = "all" , "local", "strided"
-
+    def __init__(self, **kwargs) -> None:
+        self.dim: int = kwargs.get('dim', 512)
+        self.n_embd : int = kwargs.get('dim', 512)
+        self.n_layers: int = kwargs.get('n_layer', 8)
+        self.n_heads: int = kwargs.get('n_heads', 8)
+        self.n_kv_heads: int = kwargs.get('n_kv_heads', 8)
+        self.vocab_size: int = kwargs.get('vocab_size', 32000)
+        self.max_seq_len: int = kwargs.get('max_seq_len', 1024)
+        self.dropout: float = kwargs.get('dropout', 0.0)
+        self.topk: int = kwargs.get('topk', 24)
+        self.use_block: bool = kwargs.get('use_block', False)
+        self.block_size : int = kwargs.get('block_size', 1024)
+        self.bias : bool = kwargs.get('bias',True)
+        self.hidden_dim : int = kwargs.get('hidden_dim',1376)
 
 class RMSNorm(torch.nn.Module):
 
@@ -60,15 +61,58 @@ class FeedForward(nn.Module):
     
 #TODO: Optimizing the Algoritm based on Original Papers from OPENAI 'https://arxiv.org/abs/1904.10509'
 class SparseAttention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs) -> None:
         super().__init__()
-        self.args = args
-        self.heads = args.n_heads
-        self.attn_mode = args.attn_mode
-    
-    def forward():
-        pass
+        self.n_heads = args.n_heads
+        self.n_kv_heads = args.n_kv_heads
+        self.head_dim = args.dim // args.n_heads
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(args.dim, args.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, args.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+        self.topk = args.topk
+        self.use_block_sparsity = args.use_block
 
+        # creates triangular mask
+        mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
+        mask = torch.triu(mask, diagonal=1)
+        self.register_buffer("mask", mask)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq = xq.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        xk = xk.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        xv = xv.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
+        scores = scores + self.mask[:, :, :seq_len, :seq_len]
+
+        if self.use_block_sparsity:
+            # applies block sparsity
+            block_size = 128
+            block_scores = []
+            for i in range(0, seq_len, block_size):
+                for j in range(0, seq_len, block_size):
+                    block_score = scores[:, :, i:i + block_size, j:j + block_size]
+                    block_scores.append(block_score)
+            scores = torch.cat(block_scores, dim=-1)
+        else:
+            # applies top-k sparsity
+            topk_scores, topk_indices = torch.topk(scores, min(self.topk, scores.size(-1)), dim=-1, largest=True)
+            scores = torch.zeros_like(scores).scatter(-1, topk_indices, topk_scores)
+
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        scores = self.attn_dropout(scores)
+        output = torch.matmul(scores, xv)
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        output = self.wo(output)
+        output = self.resid_dropout(output)
+        return output
 
 class TransformerBlock(nn.Module):
     def __init__(self, layer_id : int, args : ModelArgs):
@@ -125,3 +169,16 @@ class Transformer(nn.Module):
             logits = self.output(h[:, [-1], :])
             self.last_loss = None
         return logits
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        for _ in range(max_new_tokens):
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] / temperature
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+        return idx
